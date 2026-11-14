@@ -4,8 +4,8 @@ End-of-day scanner that flags US stocks trading on **unusually high volume** vs.
 their own recent average — the classic "something is happening here" signal.
 
 **📊 Live results — two pages, cross-linked at the top of each:**
-- 👉 **Daily (EOD):** https://alex-matulay.github.io/volume-scanner/ — rebuilt every weekday after the US close.
-- ⚡ **Intraday:** https://alex-matulay.github.io/volume-scanner/intraday.html — refreshed **every 30 minutes during US market hours**.
+- 👉 **Daily (EOD):** https://williamyeung72.github.io/volume-scanner/ — rebuilt every weekday after the US close.
+- ⚡ **Intraday:** https://williamyeung72.github.io/volume-scanner/intraday.html — refreshed **every 30 minutes during US market hours**.
 
 Each symbol on both pages links straight to its Yahoo Finance chart.
 
@@ -18,7 +18,17 @@ Each symbol on both pages links straight to its Yahoo Finance chart.
   **22:00 UTC on weekdays** (~6pm US Eastern, after EOD data settles). It screens
   the whole US universe fast via the free **Alpaca** API, then re-measures the
   candidates on **consolidated volume** (so the figures match Yahoo / your
-  broker).
+  broker). Before scanning, the job fetches the public daily page
+  (`index.json`, `index.html`, and `report.csv` on the site above). If that
+  page is already `mode=eod` and every row date is the NY as_of session — the
+  most recent completed US regular session (weekday, not a full-day NYSE
+  holiday, at or after 16:00 America/New_York; an early close still counts
+  after 16:00 ET) — the job exits successfully and does not scan or publish.
+  A local capture is not enough, and a page that cannot be proven fresh is
+  scanned as usual. After a scan, rows from any other session are dropped and
+  the three files are written again so the published count matches the kept
+  rows. The job still refuses to publish when no NY as_of row remains or the
+  page is not an EOD page. Intraday runs are unchanged.
 - **Intraday page** — a second Action
   ([`.github/workflows/intraday-scan.yml`](.github/workflows/intraday-scan.yml))
   runs **every 30 min, 13:00–21:00 UTC on weekdays** (US market hours). It

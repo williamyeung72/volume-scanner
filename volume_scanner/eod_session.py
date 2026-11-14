@@ -1,23 +1,37 @@
-"""Fail closed unless an EOD publish is the completed NY session.
+"""EOD publish rules for the completed NY session.
 
 NY ``as_of`` is the most recent completed US regular session: a weekday that
 is not a full-day NYSE holiday, once the clock in America/New_York is at or
 after 16:00 on that date. Weekends and full-day holidays are not sessions.
 An early close (1:00 p.m. ET) still counts as that calendar date after 16:00 ET.
 
-This is the same freshness rule ops uses before a 06:05 HKT dispatch: the
-public page is current only when ``mode=eod`` and every ``report.csv`` row
-date equals that NY as_of. The EOD CLI runs the check on the files it just
-built, and exits non-zero when they do not match, so the gh-pages publish
-step does not run.
+Two decisions use that date, and neither one weakens the publish gate:
+
+* Skip-if-fresh. Before an EOD scan, fetch the public Pages files
+  (``index.html``, ``index.json``, ``report.csv``). When they are
+  ``mode=eod`` and every row date equals NY as_of, the run exits 0 without
+  scanning or publishing. A file in a local capture does not count. If
+  freshness cannot be proven, the scan runs.
+
+* As-of rows only. After a scan, rows whose date is not NY as_of are removed
+  and the page is written from what remains, with ``n`` matching the kept
+  rows. :func:`verify_eod_outputs` still fails closed unless ``mode=eod`` and
+  every remaining row date is NY as_of. Mixed dates are not published as-is.
+
+Intraday runs do not use either decision.
 """
 
 from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 import sys
+import tempfile
+import urllib.parse
+import urllib.request
+from collections.abc import Callable
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -35,6 +49,12 @@ _RULE = (
     "(weekday, not a full-day NYSE holiday, at or after 16:00 America/New_York). "
     "Early closes still count as that session after 16:00 ET."
 )
+
+# Live GitHub Pages site. Freshness is this site's bytes, never a local capture.
+PUBLIC_EOD_BASE = "https://williamyeung72.github.io/volume-scanner/"
+PUBLIC_EOD_FILES = ("index.html", "index.json", "report.csv")
+_FETCH_LIMIT = 5_000_000
+_FETCH_TIMEOUT = 20
 
 
 class SessionDateError(Exception):
@@ -115,6 +135,10 @@ def verify_eod_outputs(
     say ``mode=eod``, and every date cell in the index (HTML and JSON) and
     every ``date`` cell in ``report.csv`` must equal NY as_of. Missing, mixed,
     or stale dates raise :class:`SessionDateError`.
+
+    This does not drop rows. Callers that scanned a mixed session must filter
+    with :func:`retain_as_of_rows` and rewrite the files first. A page that is
+    still mixed fails closed.
 
     When ``html_path`` is omitted, only the CSV is checked. The publish path
     always passes the index.
@@ -280,11 +304,158 @@ def _good_friday(year: int) -> date:
     return date(year, month, day) - timedelta(days=2)
 
 
+def retain_as_of_rows(df, *, now: datetime | None = None):
+    """Copy ``df``, keeping only rows whose session date is NY as_of.
+
+    Returns ``(kept, as_of, dropped_labels)``. ``dropped_labels`` is a sorted
+    list of the session dates that were removed; a row with no session date
+    contributes ``"missing"``. The input frame is not modified. An empty frame,
+    or one without a ``date`` column, is returned unchanged so the publish
+    gate can still refuse it.
+    """
+    expected = ny_as_of(now)
+    if df is None or len(df) == 0 or "date" not in df.columns:
+        return df, expected, []
+    keep_at: list[int] = []
+    dropped: list[str] = []
+    for _index, value in enumerate(df["date"].tolist()):
+        parsed = _parse_session_date(value)
+        if parsed == expected:
+            keep_at.append(_index)
+        else:
+            dropped.append(parsed.isoformat() if parsed is not None else "missing")
+    kept = df.iloc[keep_at].copy()
+    return kept, expected, sorted(set(dropped))
+
+
+def fetch_public_text(url: str, *, timeout: float = _FETCH_TIMEOUT) -> str:
+    """GET one public https URL and return its body as text.
+
+    Non-https URLs are refused so a local ``file:`` path cannot satisfy the
+    freshness check. Oversized bodies raise, which the caller treats as
+    "not proven fresh".
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https":
+        raise OSError(f"refusing non-https URL scheme {parsed.scheme!r}")
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "volume-scanner-eod-freshness",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Accept": "text/html,application/json,text/csv,*/*",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        final = urllib.parse.urlparse(response.geturl())
+        if final.scheme != "https":
+            raise OSError(f"refusing redirect to {final.scheme!r}")
+        raw = response.read(_FETCH_LIMIT + 1)
+    if len(raw) > _FETCH_LIMIT:
+        raise OSError(f"response larger than {_FETCH_LIMIT} bytes")
+    return raw.decode("utf-8")
+
+
+def public_eod_decision(
+    now: datetime | None = None,
+    *,
+    base_url: str = PUBLIC_EOD_BASE,
+    fetch: Callable[[str], str] | None = None,
+) -> tuple[bool, str]:
+    """Decide whether an EOD run should skip because the public page is fresh.
+
+    Returns ``(True, message)`` only when ``index.html``, ``index.json``, and
+    ``report.csv`` were fetched from ``base_url`` and :func:`verify_eod_outputs`
+    accepts them for NY as_of. Any uncertainty returns ``(False, message)`` so
+    the caller scans. This function does not raise.
+    """
+    try:
+        reason = _public_mismatch(now, base_url=base_url, fetch=fetch)
+    except Exception as exc:
+        reason = f"freshness check error: {exc.__class__.__name__}: {exc}"
+    if reason is None:
+        try:
+            day = ny_as_of(now).isoformat()
+        except Exception:
+            day = "NY as_of"
+        return True, (
+            f"Public EOD page at {base_url} is mode=eod and every row date is "
+            f"{day}. Skipping scan and publish."
+        )
+    return False, (
+        "Public EOD page is not proven fresh. Continuing with the scan.\n"
+        + reason
+    )
+
+
+def write_github_output(name: str, value: str) -> None:
+    """Append one ``name=value`` line to ``GITHUB_OUTPUT`` when Actions sets it."""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(f"{name}={value}\n")
+
+
+def _public_file_url(base_url: str, name: str) -> str:
+    base = base_url if base_url.endswith("/") else base_url + "/"
+    stamp = int(datetime.now(timezone.utc).timestamp() * 1000)
+    return f"{base}{name}?t={stamp}"
+
+
+def _public_mismatch(
+    now: datetime | None,
+    *,
+    base_url: str,
+    fetch: Callable[[str], str] | None,
+) -> str | None:
+    getter = fetch if fetch is not None else fetch_public_text
+    pages: dict[str, str] = {}
+    for name in PUBLIC_EOD_FILES:
+        url = _public_file_url(base_url, name)
+        try:
+            body = getter(url)
+        except Exception as exc:
+            return f"could not fetch {name}: {exc.__class__.__name__}: {exc}"
+        if not isinstance(body, str) or not body.strip():
+            return f"{name} was empty or not text"
+        pages[name] = body
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, body in pages.items():
+                (root / name).write_text(body, encoding="utf-8")
+            verify_eod_outputs(
+                str(root / "report.csv"),
+                str(root / "index.html"),
+                now=now,
+            )
+    except SessionDateError as exc:
+        return str(exc)
+    except Exception as exc:
+        return (
+            f"could not read the public EOD page: {exc.__class__.__name__}: {exc}"
+        )
+    return None
+
+
+def _public_fresh_main() -> int:
+    """Always exit 0. ``fresh=true`` only when the public page proves it."""
+    skip, message = public_eod_decision()
+    print(message)
+    write_github_output("fresh", "true" if skip else "false")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    if args == ["--public-fresh"]:
+        return _public_fresh_main()
     if len(args) != 2:
         print(
-            "usage: python -m volume_scanner.eod_session REPORT_CSV INDEX_HTML",
+            "usage: python -m volume_scanner.eod_session REPORT_CSV INDEX_HTML\n"
+            "       python -m volume_scanner.eod_session --public-fresh",
             file=sys.stdout,
         )
         return 2
