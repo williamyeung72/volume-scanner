@@ -245,10 +245,12 @@ def main(argv=None) -> int:
             os.makedirs(d, exist_ok=True)
         df.to_csv(args.out, index=False)
         print(f"\nSaved {len(df):,} rows -> {args.out}")
+        out_path = args.out
     else:
         default = f"volume_scan_{datetime.now():%Y%m%d_%H%M}.csv"
         df.to_csv(default, index=False)
         print(f"\nSaved {len(df):,} rows -> {default}")
+        out_path = default
 
     if args.html:
         import os
@@ -259,6 +261,29 @@ def main(argv=None) -> int:
         report_html.write(df, args.html, market=src, min_rvol=args.min_rvol,
                           mode="intraday" if args.intraday else "eod")
         print(f"Saved HTML report -> {args.html}")
+
+    # EOD publish must not succeed while the built page still has another
+    # session's dates. Intraday is a different page and a different clock.
+    if not args.intraday:
+        from .eod_session import SessionDateError, verify_eod_outputs
+
+        try:
+            expected = verify_eod_outputs(out_path, args.html)
+        except SessionDateError as exc:
+            print("EOD session check failed.")
+            print(exc)
+            print("Refusing to publish.")
+            return 1
+        if args.html:
+            print(
+                f"EOD session check passed. mode=eod and every row date is "
+                f"{expected.isoformat()}."
+            )
+        else:
+            print(
+                f"EOD session check passed. every report row date is "
+                f"{expected.isoformat()}."
+            )
 
     return 0
 
