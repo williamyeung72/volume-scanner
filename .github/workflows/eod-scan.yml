@@ -41,6 +41,13 @@ jobs:
             --earnings \
             --html site/index.html --out site/report.csv
 
+      # Second gate. The CLI already refuses to exit 0 unless mode=eod and
+      # every index / report.csv row date equals NY as_of (the most recent
+      # completed US regular session). This step repeats that check on the
+      # files that would be published, immediately before gh-pages.
+      - name: Verify EOD session dates before publish
+        run: python -m volume_scanner.eod_session site/report.csv site/index.html
+
       - name: Publish daily page to gh-pages
         uses: peaceiris/actions-gh-pages@v4
         with:
