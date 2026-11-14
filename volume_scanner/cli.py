@@ -171,6 +171,18 @@ def main(argv=None) -> int:
         path = sources.save_credentials(args.alpaca_key, args.alpaca_secret)
         print(f"Saved Alpaca credentials -> {path}")
 
+    # Same rule for a local EOD run and the scheduled workflow: a public page
+    # that is already this NY session is success, not a scan and not a failure.
+    # Intraday publishes a different page and does not consult this check.
+    if not args.intraday:
+        from .eod_session import public_eod_decision, write_github_output
+
+        skip, message = public_eod_decision()
+        print(message)
+        write_github_output("fresh", "true" if skip else "false")
+        if skip:
+            return 0
+
     if args.symbols_file:
         tickers = universe.load_csv(args.symbols_file)
         src = args.symbols_file
@@ -235,6 +247,22 @@ def main(argv=None) -> int:
         n_near = int(df["near_spike"].fillna(False).sum())
         print(f"\n  {n_rec} with record-quarter revenue; "
               f"{n_near} spiked right after earnings.")
+
+    # Keep the published page on NY as_of. Other session dates are dropped
+    # before the files are written, and the gate below still refuses a page
+    # that is not entirely that session. Intraday is left as scanned.
+    if not args.intraday:
+        from .eod_session import retain_as_of_rows
+
+        kept, as_of_day, dropped = retain_as_of_rows(df)
+        if dropped:
+            removed = len(df) - len(kept)
+            df = kept
+            print(
+                f"Dropped {removed} row(s) whose date is not NY as_of "
+                f"{as_of_day.isoformat()} ({', '.join(dropped)}). "
+                f"Writing {len(df)} row(s) to the publish files."
+            )
 
     _print_table(df, args.top, intraday=args.intraday)
 

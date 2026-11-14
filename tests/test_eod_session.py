@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import csv
 import io
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -15,11 +17,14 @@ import pandas as pd
 
 from volume_scanner.cli import main
 from volume_scanner.eod_session import (
+    PUBLIC_EOD_BASE,
     SessionDateError,
+    fetch_public_text,
     is_nyse_session,
     main as check_main,
     ny_as_of,
     nyse_full_closures,
+    retain_as_of_rows,
     verify_eod_outputs,
 )
 from volume_scanner.report_html import write
@@ -261,11 +266,20 @@ class CliGateTests(unittest.TestCase):
         original_scan = cli_mod.scan
         original_intraday = cli_mod.scan_intraday
         original_as_of = session.ny_as_of
+        original_decision = session.public_eod_decision
+        original_output = os.environ.pop("GITHUB_OUTPUT", None)
         cli_mod.universe.build_universe = _universe
         cli_mod.scan = _scan
         cli_mod.scan_intraday = _scan
         if as_of is not None:
             session.ny_as_of = lambda now=None, pinned=as_of: pinned
+
+        def _decision(*_args, **_kwargs):
+            if intraday:
+                raise AssertionError("intraday run checked public EOD freshness")
+            return False, "test stub: not fresh"
+
+        session.public_eod_decision = _decision
         argv = [
             "--market", "us",
             "--html", str(self.dir / "index.html"),
@@ -282,6 +296,11 @@ class CliGateTests(unittest.TestCase):
             cli_mod.scan = original_scan
             cli_mod.scan_intraday = original_intraday
             session.ny_as_of = original_as_of
+            session.public_eod_decision = original_decision
+            if original_output is None:
+                os.environ.pop("GITHUB_OUTPUT", None)
+            else:
+                os.environ["GITHUB_OUTPUT"] = original_output
         return code, buffer.getvalue()
 
     def test_cli_matching_dates_exit_zero(self):
@@ -322,23 +341,327 @@ class CliGateTests(unittest.TestCase):
         self.assertIn("no row dates", out)
         self.assertIn("Refusing to publish", out)
 
-    def test_intraday_does_not_apply_the_eod_gate(self):
-        code, out = self._run(pd.DataFrame([_row("2020-01-02")]), intraday=True)
-        self.assertEqual(code, 0)
+    def test_mixed_rows_are_rewritten_and_publish_check_passes(self):
+        code, out = self._run(
+            pd.DataFrame([
+                _row("2026-11-13", "AAA"),
+                _row("2026-11-12", "BBB"),
+                _row("", "CCC"),
+                _row("2026-11-13", "DDD"),
+            ]),
+            as_of=date(2026, 11, 13),
+        )
+        self.assertEqual(code, 0, out)
+        self.assertIn("Dropped 2 row(s)", out)
+        self.assertIn("2026-11-12", out)
+        self.assertIn("missing", out)
+        self.assertIn("EOD session check passed", out)
         self.assertNotIn("Refusing to publish", out)
+        with open(self.dir / "report.csv", newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual([row["symbol"] for row in rows], ["AAA", "DDD"])
+        self.assertTrue(all(row["date"] == "2026-11-13" for row in rows))
+        payload = json.loads((self.dir / "index.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["mode"], "eod")
+        self.assertEqual(payload["n"], len(rows))
+        self.assertNotIn("BBB", payload["rows_html"])
+        self.assertNotIn("CCC", payload["rows_html"])
+        self.assertNotIn("<td>2026-11-12</td>", payload["rows_html"])
+        html = (self.dir / "index.html").read_text(encoding="utf-8")
+        self.assertIn(f'id="nflag">{payload["n"]}<', html)
+        self.assertNotIn("<td>2026-11-12</td>", html)
+        self.assertIn("<td>2026-11-13</td>", html)
+        checker, checker_out = _capture_check(
+            [str(self.dir / "report.csv"), str(self.dir / "index.html")],
+            as_of=date(2026, 11, 13),
+        )
+        self.assertEqual(checker, 0, checker_out)
+
+    def test_all_old_rows_are_still_blocked(self):
+        code, out = self._run(
+            pd.DataFrame([
+                _row("2026-11-12", "AAA"),
+                _row("2026-11-10", "BBB"),
+            ]),
+            as_of=date(2026, 11, 13),
+        )
+        self.assertEqual(code, 1, out)
+        self.assertIn("EOD session check failed", out)
+        self.assertIn("Refusing to publish", out)
+        self.assertIn("2026-11-12", out)
+        self.assertIn("2026-11-10", out)
+        with open(self.dir / "report.csv", newline="", encoding="utf-8") as handle:
+            self.assertEqual(list(csv.DictReader(handle)), [])
+        checker, checker_out = _capture_check(
+            [str(self.dir / "report.csv"), str(self.dir / "index.html")],
+            as_of=date(2026, 11, 13),
+        )
+        self.assertEqual(checker, 1)
+        self.assertIn("Refusing to publish", checker_out)
+
+    def test_intraday_does_not_apply_the_eod_gate(self):
+        code, out = self._run(
+            pd.DataFrame([_row("2020-01-02"), _row("2026-11-13", "BBB")]),
+            intraday=True,
+        )
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("Refusing to publish", out)
+        self.assertNotIn("Dropped", out)
+        self.assertNotIn("Skipping scan", out)
+        with open(self.dir / "report.csv", newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual([row["symbol"] for row in rows], ["AAA", "BBB"])
 
 
 class WorkflowTests(unittest.TestCase):
     def test_publish_step_is_after_the_date_check(self):
         text = Path(".github/workflows/eod-scan.yml").read_text(encoding="utf-8")
+        fresh = text.index("--public-fresh")
         scan = text.index("python -m volume_scanner.cli")
-        verify = text.index("python -m volume_scanner.eod_session")
+        verify = text.index(
+            "python -m volume_scanner.eod_session site/report.csv site/index.html"
+        )
         publish = text.index("uses: peaceiris/actions-gh-pages")
+        self.assertLess(fresh, scan)
         self.assertLess(scan, verify)
         self.assertLess(verify, publish)
         self.assertNotIn("continue-on-error", text)
         self.assertIn("site/report.csv", text)
         self.assertIn("site/index.html", text)
+        self.assertIn("steps.fresh.outputs.fresh != 'true'", text)
+        self.assertIn("steps.scan.outputs.fresh != 'true'", text)
+        intraday = Path(".github/workflows/intraday-scan.yml").read_text(encoding="utf-8")
+        self.assertNotIn("--public-fresh", intraday)
+        self.assertNotIn("steps.fresh.outputs.fresh", intraday)
+
+
+class SkipIfFreshTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self._cwd = os.getcwd()
+        self._output = os.environ.pop("GITHUB_OUTPUT", None)
+
+    def tearDown(self):
+        os.chdir(self._cwd)
+        if self._output is None:
+            os.environ.pop("GITHUB_OUTPUT", None)
+        else:
+            os.environ["GITHUB_OUTPUT"] = self._output
+        self._tmp.cleanup()
+
+    def _pages(self, frame: pd.DataFrame, *, mode: str = "eod") -> dict[str, str]:
+        folder = self.dir / "public-snapshot"
+        folder.mkdir(exist_ok=True)
+        csv_path, html_path = _write_pair(folder, frame, mode=mode)
+        return {
+            "index.html": html_path.read_text(encoding="utf-8"),
+            "index.json": (folder / "index.json").read_text(encoding="utf-8"),
+            "report.csv": csv_path.read_text(encoding="utf-8"),
+        }
+
+    def _run_cli(self, pages: dict[str, str] | None, *, fetch=None):
+        import volume_scanner.cli as cli_mod
+        import volume_scanner.eod_session as session
+
+        calls = {"scan": 0, "urls": []}
+
+        def _fetch(url: str) -> str:
+            calls["urls"].append(url)
+            if fetch is not None:
+                return fetch(url)
+            assert pages is not None
+            for name, body in pages.items():
+                if f"/{name}?" in url:
+                    return body
+            raise OSError(f"unexpected url {url}")
+
+        def _universe(*_args, **_kwargs):
+            return ["AAA"]
+
+        def _scan(*_args, **_kwargs):
+            calls["scan"] += 1
+            return pd.DataFrame([_row("2026-11-13")])
+
+        original_universe = cli_mod.universe.build_universe
+        original_scan = cli_mod.scan
+        original_intraday = cli_mod.scan_intraday
+        original_as_of = session.ny_as_of
+        original_fetch = session.fetch_public_text
+        cli_mod.universe.build_universe = _universe
+        cli_mod.scan = _scan
+        cli_mod.scan_intraday = _scan
+        session.ny_as_of = lambda now=None: date(2026, 11, 13)
+        session.fetch_public_text = _fetch
+        argv = [
+            "--market", "us",
+            "--html", str(self.dir / "out" / "index.html"),
+            "--out", str(self.dir / "out" / "report.csv"),
+        ]
+        buffer = io.StringIO()
+        try:
+            with redirect_stdout(buffer):
+                code = main(argv)
+        finally:
+            cli_mod.universe.build_universe = original_universe
+            cli_mod.scan = original_scan
+            cli_mod.scan_intraday = original_intraday
+            session.ny_as_of = original_as_of
+            session.fetch_public_text = original_fetch
+        return code, buffer.getvalue(), calls
+
+    def _run_public_fresh_command(self, pages: dict[str, str]) -> tuple[int, str, str]:
+        import volume_scanner.eod_session as session
+
+        output = self.dir / "github_output.txt"
+        os.environ["GITHUB_OUTPUT"] = str(output)
+
+        def _fetch(url: str) -> str:
+            for name, body in pages.items():
+                if f"/{name}?" in url:
+                    return body
+            raise OSError(f"unexpected url {url}")
+
+        original_as_of = session.ny_as_of
+        original_fetch = session.fetch_public_text
+        session.ny_as_of = lambda now=None: date(2026, 11, 13)
+        session.fetch_public_text = _fetch
+        buffer = io.StringIO()
+        try:
+            with redirect_stdout(buffer):
+                code = check_main(["--public-fresh"])
+        finally:
+            session.ny_as_of = original_as_of
+            session.fetch_public_text = original_fetch
+        text = output.read_text(encoding="utf-8") if output.exists() else ""
+        return code, buffer.getvalue(), text
+
+    def test_public_base_is_the_live_site(self):
+        self.assertEqual(
+            PUBLIC_EOD_BASE.rstrip("/"),
+            "https://williamyeung72.github.io/volume-scanner",
+        )
+        self.assertTrue(PUBLIC_EOD_BASE.startswith("https://"))
+
+    def test_fetcher_refuses_non_https(self):
+        with self.assertRaises(OSError):
+            fetch_public_text("file:///tmp/index.html")
+        with self.assertRaises(OSError):
+            fetch_public_text(
+                "http://williamyeung72.github.io/volume-scanner/index.html"
+            )
+
+    def test_fresh_public_page_skips_and_exits_zero(self):
+        pages = self._pages(pd.DataFrame([
+            _row("2026-11-13", "AAA"),
+            _row("2026-11-13", "BBB"),
+        ]))
+        code, out, calls = self._run_cli(pages)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(calls["scan"], 0)
+        self.assertIn("Skipping scan and publish.", out)
+        self.assertIn(PUBLIC_EOD_BASE, out)
+        self.assertNotIn("Refusing to publish", out)
+        self.assertFalse((self.dir / "out" / "report.csv").exists())
+        for name in ("index.html", "index.json", "report.csv"):
+            self.assertTrue(
+                any(f"/{name}?" in url for url in calls["urls"]),
+                calls["urls"],
+            )
+        self.assertTrue(all(url.startswith("https://") for url in calls["urls"]))
+
+    def test_stale_public_page_does_not_skip(self):
+        pages = self._pages(pd.DataFrame([_row("2026-11-12")] * 2))
+        code, out, calls = self._run_cli(pages)
+        self.assertEqual(calls["scan"], 1)
+        self.assertEqual(code, 0, out)
+        self.assertIn("Continuing with the scan", out)
+        self.assertNotIn("Skipping scan", out)
+
+    def test_mixed_public_dates_do_not_skip(self):
+        pages = self._pages(pd.DataFrame([
+            _row("2026-11-13", "AAA"),
+            _row("2026-11-12", "BBB"),
+        ]))
+        code, out, calls = self._run_cli(pages)
+        self.assertEqual(calls["scan"], 1, out)
+        self.assertIn("Continuing with the scan", out)
+        self.assertNotIn("Skipping scan", out)
+        self.assertEqual(code, 0, out)
+
+    def test_public_intraday_mode_does_not_skip(self):
+        pages = self._pages(pd.DataFrame([_row("2026-11-13")]), mode="intraday")
+        _code, out, calls = self._run_cli(pages)
+        self.assertEqual(calls["scan"], 1, out)
+        self.assertIn("Continuing with the scan", out)
+        self.assertNotIn("Skipping scan", out)
+
+    def test_unreachable_public_page_does_not_skip(self):
+        def _boom(_url: str) -> str:
+            raise TimeoutError("timed out")
+
+        _code, out, calls = self._run_cli({}, fetch=_boom)
+        self.assertEqual(calls["scan"], 1, out)
+        self.assertIn("Continuing with the scan", out)
+        self.assertNotIn("Skipping scan", out)
+
+    def test_local_capture_does_not_count_as_fresh(self):
+        site = self.dir / "site"
+        capture = self.dir / "capture"
+        site.mkdir()
+        capture.mkdir()
+        _write_pair(
+            site,
+            pd.DataFrame([_row("2026-11-13"), _row("2026-11-13", "BBB")]),
+        )
+        _write_pair(capture, pd.DataFrame([_row("2026-11-13")]))
+        os.chdir(self.dir)
+        pages = self._pages(pd.DataFrame([_row("2026-11-12")]))
+        _code, out, calls = self._run_cli(pages)
+        self.assertEqual(calls["scan"], 1, out)
+        self.assertIn("Continuing with the scan", out)
+        self.assertNotIn("Skipping scan", out)
+        self.assertTrue(any("index.json" in url for url in calls["urls"]))
+
+    def test_public_fresh_command_sets_output_and_exits_zero(self):
+        pages = self._pages(pd.DataFrame([_row("2026-11-13")]))
+        code, out, output = self._run_public_fresh_command(pages)
+        self.assertEqual(code, 0, out)
+        self.assertIn("Skipping scan and publish.", out)
+        self.assertIn("fresh=true", output)
+
+    def test_public_fresh_command_does_not_fail_when_the_page_is_mixed(self):
+        pages = self._pages(pd.DataFrame([
+            _row("2026-11-13", "AAA"),
+            _row("2026-11-12", "BBB"),
+        ]))
+        code, out, output = self._run_public_fresh_command(pages)
+        self.assertEqual(code, 0, out)
+        self.assertIn("Continuing with the scan", out)
+        self.assertIn("fresh=false", output)
+        self.assertNotIn("fresh=true", output)
+
+
+class RetainAsOfRowTests(unittest.TestCase):
+    def test_keeps_only_as_of_rows_without_mutating_the_input(self):
+        import volume_scanner.eod_session as session
+
+        frame = pd.DataFrame([
+            _row("2026-11-13", "AAA"),
+            _row("", "BBB"),
+            _row("2026-11-12", "CCC"),
+            _row("2026-11-13", "DDD"),
+        ])
+        original = session.ny_as_of
+        session.ny_as_of = lambda now=None: date(2026, 11, 13)
+        try:
+            kept, as_of, dropped = retain_as_of_rows(frame)
+        finally:
+            session.ny_as_of = original
+        self.assertEqual(as_of, date(2026, 11, 13))
+        self.assertEqual(list(kept["symbol"]), ["AAA", "DDD"])
+        self.assertEqual(dropped, ["2026-11-12", "missing"])
+        self.assertEqual(list(frame["symbol"]), ["AAA", "BBB", "CCC", "DDD"])
 
 
 def _capture_check(argv: list[str], *, as_of: date | None = None) -> tuple[int, str]:

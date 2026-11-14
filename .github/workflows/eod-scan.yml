@@ -30,7 +30,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r volume_scanner/requirements.txt
 
+      # Fetch the live public page (index.html, index.json, report.csv).
+      # fresh=true only when that page is mode=eod and every row date is
+      # today's NY as_of. The step always exits 0; a stale, mixed, or
+      # unreachable page sets fresh=false and the scan below runs.
+      - name: Check whether the public EOD page is already fresh
+        id: fresh
+        run: python -m volume_scanner.eod_session --public-fresh
+
       - name: Run end-of-day scan and build the page
+        id: scan
+        if: ${{ steps.fresh.outputs.fresh != 'true' }}
         env:
           APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
           APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
@@ -43,12 +53,16 @@ jobs:
 
       # Second gate. The CLI already refuses to exit 0 unless mode=eod and
       # every index / report.csv row date equals NY as_of (the most recent
-      # completed US regular session). This step repeats that check on the
-      # files that would be published, immediately before gh-pages.
+      # completed US regular session). Rows from any other session are dropped
+      # before this check. This step repeats the check on the files that would
+      # be published, immediately before gh-pages. It does not run when the
+      # public page was already fresh, so a no-op run is not a failure.
       - name: Verify EOD session dates before publish
+        if: ${{ steps.fresh.outputs.fresh != 'true' && steps.scan.outputs.fresh != 'true' }}
         run: python -m volume_scanner.eod_session site/report.csv site/index.html
 
       - name: Publish daily page to gh-pages
+        if: ${{ steps.fresh.outputs.fresh != 'true' && steps.scan.outputs.fresh != 'true' }}
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
